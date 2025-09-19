@@ -208,14 +208,14 @@ Focused PRs welcome for: performance, observability, policy modularity.
 ---
 
 ## 📜 License
-Add your chosen license (MIT / Apache-2.0 / etc.).
+MIT
 
 ---
 
 ## ⭐ Support
 If this bot helps harden your Telegram infrastructure:
-- Star the repo
+- Fork the repo
 - Open well‑scoped issues
 - Propose policy extensions
 
-Happy controlling. 🛡
+Happy controlling. 🛡 And use Linux! 
