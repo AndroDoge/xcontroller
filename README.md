@@ -7,7 +7,7 @@ Automates moderation, forwarding, bans, and more — fast, secure, and easy to s
 
 ## ✨ Features
 
-- 🔐 **Username Check**: Auto-kicks new members without @username
+- 🔐 **Username Check**: Configurable auto-kick for new members without @username
 - 🚫 **Content Moderation**: Deletes messages with banned words, bans repeat offenders
 - 🌐 **Global Ban**: Bans propagate to all managed groups
 - 📡 **Message Forwarding**: Forwards plain text to up to 20 groups, with per-user 24h cooldown
@@ -58,13 +58,15 @@ Automates moderation, forwarding, bans, and more — fast, secure, and easy to s
 
 ## ⚙️ Configuration
 
-| Variable      | Required | Description                            |
-|---------------|----------|----------------------------------------|
-| API_ID        | ✅       | Telegram API ID                        |
-| API_HASH      | ✅       | Telegram API Hash                      |
-| BOT_TOKEN     | ✅       | Bot token from @BotFather              |
-| SALT          | ✅       | Secure random string for user tracking |
-| BANNED_WORDS  | ❌       | Comma-separated banned words           |
+| Variable               | Required | Description                                      |
+|------------------------|----------|--------------------------------------------------|
+| API_ID                 | ✅       | Telegram API ID                                  |
+| API_HASH               | ✅       | Telegram API Hash                                |
+| BOT_TOKEN              | ✅       | Bot token from @BotFather                        |
+| SALT                   | ✅       | Secure random string for user tracking          |
+| BANNED_WORDS           | ❌       | Comma-separated banned words                     |
+| ENFORCE_USERNAME       | ❌       | Kick users without @username (1=yes, 0=no)      |
+| USERNAME_KICK_NOTICE   | ❌       | Message sent before kicking (if enforcement on) |
 
 ---
 ## 🔐 About `SALT` Security**
@@ -91,6 +93,48 @@ Automates moderation, forwarding, bans, and more — fast, secure, and easy to s
    - Moderates messages
    - Forwards plain text
    - Cleans up deleted accounts
+
+---
+
+## 🔐 Username Enforcement
+
+Control whether the bot automatically kicks new members who don't have a public @username.
+
+### Configuration
+
+- **`ENFORCE_USERNAME`** (default: `1`)
+  - `1` or `true` → Kick users without @username
+  - `0` or `false` → Allow all users regardless of username
+  
+- **`USERNAME_KICK_NOTICE`** (default: empty)
+  - If set, bot sends this message before kicking
+  - Best-effort delivery (failures are ignored)
+  - Example: `"Please set a public @username to participate."`
+
+### Behavior
+
+- **When enabled** (`ENFORCE_USERNAME=1`):
+  - New users without @username are immediately kicked
+  - Optional notice message sent before kick
+  - Structured logging: `[USERNAME ENFORCE] kicked user_id=<id> group=<group_id>`
+  
+- **When disabled** (`ENFORCE_USERNAME=0`):
+  - All users allowed to join regardless of username
+  - No enforcement actions taken
+
+### Examples
+
+```env
+# Strict enforcement with notice
+ENFORCE_USERNAME=1
+USERNAME_KICK_NOTICE=Please set a public @username to participate in this group.
+
+# Enforcement without notice
+ENFORCE_USERNAME=1
+
+# No enforcement
+ENFORCE_USERNAME=0
+```
 
 ---
 

@@ -2,7 +2,7 @@
 """
 Telegram Admin Bot - XController
 A Telegram bot for group administration with the following features:
-1. Auto-kick new members without username
+1. Configurable auto-kick new members without username
 2. Filter banned words from messages
 3. Clean up deleted accounts
 4. Progressive enforcement for banned words (delete -> ban)
@@ -245,6 +245,10 @@ class TelegramAdminBot:
         self.bot_token = os.getenv('BOT_TOKEN')
         self.salt = os.getenv('SALT')
         
+        # Username enforcement configuration
+        self.enforce_username = os.getenv('ENFORCE_USERNAME', '1').lower() in ('1', 'true', 'yes', 'on')
+        self.username_kick_notice = os.getenv('USERNAME_KICK_NOTICE', '')
+        
         # Banned words from environment
         banned_words_str = os.getenv('BANNED_WORDS', '')
         self.banned_words = set(word.strip().lower() for word in banned_words_str.split(',') if word.strip())
@@ -349,16 +353,41 @@ class TelegramAdminBot:
             
             for user_id in users:
                 try:
+                    # Use get_entity only as requested (lightweight approach)
                     user = await self.client.get_entity(user_id)
                     
                     # Skip if it's a bot
                     if hasattr(user, 'bot') and user.bot:
                         continue
                     
-                    # Check if user has a username
+                    # Check if user has a username - only enforce if enabled
                     if not hasattr(user, 'username') or not user.username:
-                        logger.info(f"Kicking user {user.id} ({getattr(user, 'first_name', 'Unknown')}) - no username")
-                        await self.kick_user(event.chat_id, user_id)
+                        if self.enforce_username:
+                            # Send optional notice before kick (best-effort)
+                            if self.username_kick_notice:
+                                try:
+                                    await self.client.send_message(
+                                        event.chat_id, 
+                                        self.username_kick_notice, 
+                                        reply_to=event.action_message.id
+                                    )
+                                except Exception:
+                                    # Ignore failures as requested (best-effort)
+                                    pass
+                            
+                            # Kick user using rpc_call wrapper for consistent flood handling
+                            await self.rpc_call(
+                                "username_kick", 
+                                self.client.edit_permissions, 
+                                event.chat_id, 
+                                user.id, 
+                                view_messages=False
+                            )
+                            
+                            # Log structured line as requested
+                            logger.info(f"[USERNAME ENFORCE] kicked user_id={user.id} group={event.chat_id}")
+                        else:
+                            logger.info(f"User {user.id} ({getattr(user, 'first_name', 'Unknown')}) joined without username - allowed (enforcement disabled)")
                     else:
                         logger.info(f"User {user.username} joined and has username - allowed")
                         
@@ -519,6 +548,26 @@ class TelegramAdminBot:
             await asyncio.sleep(e.seconds)
         except Exception as e:
             logger.error(f"Error kicking user {user_id}: {e}")
+
+    async def rpc_call(self, operation_name: str, func, *args, **kwargs):
+        """Wrapper for RPC calls with flood handling"""
+        try:
+            return await func(*args, **kwargs)
+        except FloodWaitError as e:
+            logger.warning(f"Flood wait for {operation_name}: waiting {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+            # Retry once after flood wait
+            try:
+                return await func(*args, **kwargs)
+            except Exception as retry_e:
+                logger.error(f"Error in {operation_name} after flood wait: {retry_e}")
+                raise
+        except (ChatAdminRequiredError, UserAdminInvalidError):
+            logger.error(f"Bot lacks admin permissions for {operation_name}")
+            raise
+        except Exception as e:
+            logger.error(f"Error in {operation_name}: {e}")
+            raise
 
     async def rate_limited_ban_user(self, chat_id: int, user_id: int):
         """Ban a user with rate limiting"""
