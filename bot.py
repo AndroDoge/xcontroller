@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Telegram Admin Bot - XController
-A Telegram bot for group administration with the following features:
-1. Configurable auto-kick new members without username
-2. Filter banned words from messages
-3. Clean up deleted accounts
-4. Progressive enforcement for banned words (delete -> ban)
+XController Telegram Admin Bot
+
+Features:
+- Enforces that new members have a username (optional auto‑kick)
+- Banned word filtering with progressive discipline (delete -> global ban)
+- Global ban propagation across configured groups
+- Periodic cleanup of deleted accounts (rotational)
+- True Telegram forwarding (preserves 'Forwarded from' metadata) with per‑message random delay
+- Support for specifying forward targets via FORWARD_GROUP_IDS (chat_id or chat_id:topic_id; topic IDs stored but not used for forwarding yet)
+
+Environment (core): API_ID, API_HASH, BOT_TOKEN, SALT
+Optional: BANNED_WORDS, ENFORCE_USERNAME, USERNAME_KICK_NOTICE, FORWARD_GROUP_IDS, FORWARD_DELAY_MIN, FORWARD_DELAY_MAX
 """
 
 import os
@@ -16,15 +22,14 @@ import sqlite3
 import hashlib
 import hmac
 import time
-from typing import Dict, Set, List, Optional
+import random
+from typing import List, Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon.tl.types import (
-    ChatBannedRights, 
-    User,
-    MessageService,
+    ChatBannedRights,
     MessageActionChatAddUser,
     MessageActionChatJoinedByLink
 )
@@ -35,7 +40,6 @@ from telethon.errors import (
 )
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 # Setup data directory with fallback
@@ -52,10 +56,10 @@ def get_data_dir() -> Path:
         except (PermissionError, OSError):
             pass
     
-    # Fallback to ./data
-    fallback_dir = Path("./data")
-    fallback_dir.mkdir(exist_ok=True)
-    return fallback_dir
+    # Fallback to local data directory
+    local_data_dir = Path("./data")
+    local_data_dir.mkdir(exist_ok=True)
+    return local_data_dir
 
 DATA_DIR = get_data_dir()
 
@@ -74,29 +78,26 @@ logger.info(f"Using data directory: {DATA_DIR}")
 
 class TokenBucket:
     """Token bucket implementation for rate limiting"""
-    def __init__(self, capacity: int = 10, refill_rate: float = 2.0):
+    def __init__(self, capacity: int, refill_rate: float):
         self.capacity = capacity
         self.tokens = capacity
         self.refill_rate = refill_rate
         self.last_refill = time.time()
-
-    async def consume(self, tokens: int = 1) -> bool:
-        """Try to consume tokens, return True if successful"""
-        now = time.time()
-        # Add tokens based on time passed
-        time_passed = now - self.last_refill
-        self.tokens = min(self.capacity, self.tokens + (time_passed * self.refill_rate))
-        self.last_refill = now
-        
-        if self.tokens >= tokens:
-            self.tokens -= tokens
-            return True
-        return False
-
+    
     async def wait_for_token(self):
         """Wait until a token is available"""
-        while not await self.consume():
-            await asyncio.sleep(0.1)
+        while True:
+            now = time.time()
+            tokens_to_add = (now - self.last_refill) * self.refill_rate
+            self.tokens = min(self.capacity, self.tokens + tokens_to_add)
+            self.last_refill = now
+            
+            if self.tokens >= 1:
+                self.tokens -= 1
+                break
+            
+            sleep_time = (1 - self.tokens) / self.refill_rate
+            await asyncio.sleep(sleep_time)
 
 class DatabaseManager:
     """Manage SQLite database operations"""
@@ -169,8 +170,10 @@ class DatabaseManager:
                 INSERT OR REPLACE INTO violations (user_hash, count, last_violation)
                 VALUES (?, COALESCE((SELECT count FROM violations WHERE user_hash = ?), 0) + 1, ?)
             ''', (user_hash, user_hash, datetime.now()))
+            cursor.execute('SELECT count FROM violations WHERE user_hash = ?', (user_hash,))
+            result = cursor.fetchone()
             conn.commit()
-            return self.get_user_violations(user_id)
+            return result[0]
     
     def is_globally_banned(self, user_id: int) -> bool:
         """Check if user is globally banned"""
@@ -215,7 +218,7 @@ class DatabaseManager:
             ''', (user_hash, datetime.now()))
             conn.commit()
     
-    def get_cleanup_state(self, group_id: int) -> tuple:
+    def get_cleanup_state(self, group_id: int) -> Tuple[Optional[datetime], int]:
         """Get cleanup state for group"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -253,18 +256,49 @@ class TelegramAdminBot:
         banned_words_str = os.getenv('BANNED_WORDS', '')
         self.banned_words = set(word.strip().lower() for word in banned_words_str.split(',') if word.strip())
         
-        # Manual forward group IDs from environment
+        # Forward delay configuration
+        forward_delay_min = float(os.getenv('FORWARD_DELAY_MIN', '0.8'))
+        forward_delay_max = float(os.getenv('FORWARD_DELAY_MAX', '2.4'))
+        
+        # Ensure min <= max, swap if misordered
+        if forward_delay_min > forward_delay_max:
+            forward_delay_min, forward_delay_max = forward_delay_max, forward_delay_min
+        
+        self.forward_delay_min = forward_delay_min
+        self.forward_delay_max = forward_delay_max
+        
+        # Manual forward group IDs from environment with topic parsing
         forward_group_ids_str = os.getenv('FORWARD_GROUP_IDS', '')
         self.manual_forward_groups = []
+        self.group_topics = {}  # Store topic IDs for future use
+        
         if forward_group_ids_str.strip():
             try:
-                # Parse comma-separated list of integers
-                group_ids = [int(gid.strip()) for gid in forward_group_ids_str.split(',') if gid.strip()]
-                self.manual_forward_groups = group_ids
+                # Parse comma-separated list with topic support (chat_id:topic_id)
+                for entry in forward_group_ids_str.split(','):
+                    entry = entry.strip()
+                    if not entry:
+                        continue
+                    
+                    if ':' in entry:
+                        # Format: chat_id:topic_id
+                        chat_id_str, topic_id_str = entry.split(':', 1)
+                        chat_id = int(chat_id_str.strip())
+                        topic_id = int(topic_id_str.strip())
+                        self.manual_forward_groups.append(chat_id)
+                        self.group_topics[chat_id] = topic_id
+                    else:
+                        # Format: chat_id only
+                        chat_id = int(entry)
+                        self.manual_forward_groups.append(chat_id)
+                
                 logger.info(f"Loaded {len(self.manual_forward_groups)} forward group IDs from env (manual mode)")
+                if self.group_topics:
+                    logger.info(f"Topic IDs parsed: {self.group_topics}")
             except ValueError as e:
                 logger.error(f"Invalid FORWARD_GROUP_IDS format: {e}. Using auto-discovery instead.")
                 self.manual_forward_groups = []
+                self.group_topics = {}
         
         # Validate required environment variables
         if not all([self.api_id, self.api_hash, self.bot_token, self.salt]):
@@ -286,116 +320,190 @@ class TelegramAdminBot:
         
         logger.info("Bot initialized successfully")
     
-    async def start(self):
-        """Start the bot and register event handlers"""
-        await self.client.start(bot_token=self.bot_token)
-        logger.info("Bot started successfully")
+    def contains_banned_words(self, text: str) -> bool:
+        """Check if text contains any banned words"""
+        if not self.banned_words or not text:
+            return False
         
-        # Setup forwarding groups (manual or auto-discovery)
-        await self.discover_forward_groups()
+        text_lower = text.lower()
         
-        # Register event handlers
-        self.client.add_event_handler(self.handle_new_member, events.ChatAction)
-        self.client.add_event_handler(self.handle_message, events.NewMessage)
+        for banned_word in self.banned_words:
+            # Word boundary check
+            word_pattern = r'\b' + re.escape(banned_word) + r'\b'
+            if re.search(word_pattern, text_lower):
+                return True
+            
+            # Substring check for compound words or creative spelling
+            if banned_word in text_lower:
+                return True
         
-        # Schedule maintenance tasks
-        asyncio.create_task(self.maintenance_loop())
-        
-        logger.info("Event handlers registered, bot is running...")
+        return False
+    
+    async def rate_limited_ban_user(self, chat_id: int, user_id: int):
+        """Ban user with rate limiting"""
+        try:
+            await self.rate_limiter.wait_for_token()
+            
+            # Create ban rights (forever ban)
+            ban_rights = ChatBannedRights(
+                until_date=None,  # Forever
+                view_messages=True,
+                send_messages=True,
+                send_media=True,
+                send_stickers=True,
+                send_gifs=True,
+                send_games=True,
+                send_inline=True,
+                embed_links=True
+            )
+            
+            await self.client.edit_permissions(chat_id, user_id, ban_rights)
+            logger.info(f"[GLOBAL BAN] Banned user {user_id} in group {chat_id}")
+            
+        except (ChatAdminRequiredError, UserAdminInvalidError):
+            logger.warning(f"Cannot ban user {user_id} in group {chat_id} - insufficient permissions")
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait when banning user {user_id}: waiting {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+            # Single retry
+            try:
+                await self.client.edit_permissions(chat_id, user_id, ban_rights)
+                logger.info(f"[GLOBAL BAN] Banned user {user_id} in group {chat_id} (after retry)")
+            except Exception as retry_e:
+                logger.error(f"Failed to ban user {user_id} after retry: {retry_e}")
+        except Exception as e:
+            logger.error(f"Error banning user {user_id} in group {chat_id}: {e}")
     
     async def discover_forward_groups(self):
         """Setup groups for forwarding (manual or auto-discovery)"""
-        # Use manual group IDs if provided
-        if self.manual_forward_groups:
-            self.forward_groups = self.manual_forward_groups.copy()
-            logger.info(f"Using manual forward groups: {len(self.forward_groups)} groups configured")
-            logger.info("Skipping auto-discovery because FORWARD_GROUP_IDS provided")
-            return
-        
-        # Fallback to auto-discovery with best-effort error handling
-        logger.info("FORWARD_GROUP_IDS not provided, attempting auto-discovery as fallback")
-        self.forward_groups = []
         try:
-            async for dialog in self.client.iter_dialogs():
-                if (dialog.is_group or dialog.is_channel) and len(self.forward_groups) < 20:
+            if self.manual_forward_groups:
+                # Use manually configured groups
+                self.forward_groups = self.manual_forward_groups.copy()
+                logger.info(f"Using {len(self.forward_groups)} manually configured forward groups")
+                return
+            
+            # Auto-discovery mode
+            logger.info("Starting auto-discovery of forward groups...")
+            discovered_groups = []
+            
+            async for dialog in self.client.iter_dialogs(limit=100):
+                if dialog.is_group or dialog.is_channel:
+                    # Check if we're admin
                     try:
-                        # Check if bot has permissions to send messages
-                        await self.client.get_permissions(dialog.id, 'me')
-                        self.forward_groups.append(dialog.id)
-                    except Exception:
-                        # Skip groups where bot doesn't have permissions
+                        permissions = await self.client.get_permissions(dialog.id, 'me')
+                        if permissions.is_admin or permissions.is_creator:
+                            discovered_groups.append(dialog.id)
+                            if len(discovered_groups) >= 20:
+                                break
+                    except Exception as e:
+                        logger.debug(f"Could not check permissions for {dialog.id}: {e}")
                         continue
             
+            self.forward_groups = discovered_groups
             logger.info(f"Auto-discovered {len(self.forward_groups)} groups for forwarding")
+            
         except Exception as e:
             logger.error(f"Error in auto-discovery (non-fatal): {e}")
             logger.info("Bot will continue without forwarding groups")
     
     async def handle_new_member(self, event):
-        """Handle new members joining the group"""
+        """Handle new member events and check username requirement"""
+        if not self.enforce_username:
+            return
+        
         try:
-            # Check if this is a user join event
-            if not hasattr(event, 'action_message') or not event.action_message:
-                return
+            action = event.action
+            user_ids = []
             
-            action = event.action_message.action
-            
-            # Get the users who joined
-            users = []
-            if hasattr(action, 'users'):
-                # Users were added by someone
-                users = action.users
-            elif hasattr(event.action_message, 'from_id') and event.action_message.from_id:
-                # User joined by link
-                users = [event.action_message.from_id.user_id if hasattr(event.action_message.from_id, 'user_id') else event.action_message.from_id]
+            if isinstance(action, MessageActionChatAddUser):
+                user_ids = action.users
+            elif isinstance(action, MessageActionChatJoinedByLink):
+                user_ids = [event.from_id.user_id if hasattr(event.from_id, 'user_id') else event.from_id]
             else:
                 return
             
-            for user_id in users:
+            for user_id in user_ids:
                 try:
-                    # Use get_entity only as requested (lightweight approach)
+                    # Get user entity
                     user = await self.client.get_entity(user_id)
                     
-                    # Skip if it's a bot
-                    if hasattr(user, 'bot') and user.bot:
-                        continue
-                    
-                    # Check if user has a username - only enforce if enabled
+                    # Check if user has a username
                     if not hasattr(user, 'username') or not user.username:
-                        if self.enforce_username:
-                            # Send optional notice before kick (best-effort)
-                            if self.username_kick_notice:
-                                try:
-                                    await self.client.send_message(
-                                        event.chat_id, 
-                                        self.username_kick_notice, 
-                                        reply_to=event.action_message.id
-                                    )
-                                except Exception:
-                                    # Ignore failures as requested (best-effort)
-                                    pass
-                            
-                            # Kick user using rpc_call wrapper for consistent flood handling
-                            await self.rpc_call(
-                                "username_kick", 
-                                self.client.edit_permissions, 
-                                event.chat_id, 
-                                user.id, 
-                                view_messages=False
-                            )
-                            
-                            # Log structured line as requested
-                            logger.info(f"[USERNAME ENFORCE] kicked user_id={user.id} group={event.chat_id}")
-                        else:
-                            logger.info(f"User {user.id} ({getattr(user, 'first_name', 'Unknown')}) joined without username - allowed (enforcement disabled)")
-                    else:
-                        logger.info(f"User {user.username} joined and has username - allowed")
+                        logger.info(f"[USERNAME ENFORCE] User {user_id} has no username, kicking from group {event.chat_id}")
                         
-                except Exception as e:
-                    logger.error(f"Error processing new member {user_id}: {e}")
+                        # Send notice if configured
+                        if self.username_kick_notice:
+                            try:
+                                await self.client.send_message(event.chat_id, self.username_kick_notice)
+                            except Exception as notice_e:
+                                logger.debug(f"Could not send username notice: {notice_e}")
+                        
+                        # Kick the user
+                        await self.rate_limiter.wait_for_token()
+                        await self.client.kick_participant(event.chat_id, user_id)
+                        
+                except Exception as user_e:
+                    logger.error(f"Error handling user {user_id} in username enforcement: {user_e}")
                     
         except Exception as e:
             logger.error(f"Error in handle_new_member: {e}")
+    
+    async def handle_message_forwarding(self, event, user_id: int, message_text: str):
+        """Handle message forwarding logic with true Telegram forwarding"""
+        try:
+            # Check if user can forward (24h cooldown)
+            if not self.db.can_forward(user_id):
+                return
+            
+            # Skip if message contains banned words
+            if self.contains_banned_words(message_text):
+                return
+            
+            # Forward to all available groups using true forwarding
+            forwarded_count = 0
+            for group_id in self.forward_groups:
+                if group_id == event.chat_id:
+                    continue  # Don't forward to the same group
+                
+                try:
+                    await self.rate_limiter.wait_for_token()
+                    
+                    # True Telegram forwarding with preserved metadata
+                    await self.client.forward_messages(
+                        entity=group_id,
+                        messages=event.message,
+                        from_peer=event.chat_id
+                    )
+                    
+                    forwarded_count += 1
+                    
+                    # Random delay per target
+                    delay = random.uniform(self.forward_delay_min, self.forward_delay_max)
+                    await asyncio.sleep(delay)
+                    
+                except FloodWaitError as e:
+                    logger.warning(f"FloodWait when forwarding to group {group_id}: waiting {e.seconds} seconds")
+                    await asyncio.sleep(e.seconds)
+                    # Single retry
+                    try:
+                        await self.client.forward_messages(
+                            entity=group_id,
+                            messages=event.message,
+                            from_peer=event.chat_id
+                        )
+                        forwarded_count += 1
+                    except Exception as retry_e:
+                        logger.error(f"Error forwarding to group {group_id} after retry: {retry_e}")
+                except Exception as e:
+                    logger.error(f"Error forwarding to group {group_id}: {e}")
+            
+            if forwarded_count > 0:
+                logger.info(f"Forwarded message from user {user_id} to {forwarded_count} groups")
+                self.db.update_forward_time(user_id)
+        
+        except Exception as e:
+            logger.error(f"Error in message forwarding: {e}")
     
     async def handle_message(self, event):
         """Handle new messages and check for banned words"""
@@ -420,10 +528,7 @@ class TelegramAdminBot:
                 await self.rate_limited_ban_user(event.chat_id, user_id)
                 return
             
-            message_text = event.message.text
-            
-            if not message_text:
-                return
+            message_text = event.message.text or ""
             
             # Handle /id command
             if message_text.strip().lower() == '/id':
@@ -439,7 +544,10 @@ class TelegramAdminBot:
                 logger.info(f"Banned word detected in message from user {user_id}")
                 
                 # Delete the message
-                await event.delete()
+                try:
+                    await event.delete()
+                except Exception as del_e:
+                    logger.warning(f"Could not delete message: {del_e}")
                 
                 # Track violations in database
                 violation_count = self.db.add_violation(user_id)
@@ -448,212 +556,100 @@ class TelegramAdminBot:
                     # Second violation - global ban
                     logger.info(f"Globally banning user {user_id} for repeated banned word usage")
                     self.db.add_global_ban(user_id, "Multiple banned word violations")
-                    await self.propagate_global_ban(user_id)
+                    
+                    # Propagate ban to all forward groups
+                    for group_id in self.forward_groups:
+                        await self.rate_limited_ban_user(group_id, user_id)
                 else:
-                    # First violation - just delete message
-                    logger.info(f"First violation for user {user_id} - message deleted")
-            else:
-                # Forward message if conditions are met
+                    logger.info(f"User {user_id} violation count: {violation_count}")
+                
+                return
+            
+            # Only forward if message has text content and is from a non-banned user
+            if message_text:
                 await self.handle_message_forwarding(event, user_id, message_text)
                     
         except Exception as e:
             logger.error(f"Error in handle_message: {e}")
     
-    async def handle_message_forwarding(self, event, user_id: int, message_text: str):
-        """Handle message forwarding logic"""
+    async def cleanup_deleted_accounts(self, group_id: int):
+        """Clean up deleted accounts from a specific group"""
         try:
-            # Only forward plain text messages (no media)
-            if not message_text or event.message.media:
+            last_cleanup, last_offset = self.db.get_cleanup_state(group_id)
+            
+            # Skip if cleaned recently (within 12 hours)
+            if last_cleanup and datetime.now() - last_cleanup < timedelta(hours=12):
                 return
             
-            # Check if user can forward (24h cooldown)
-            if not self.db.can_forward(user_id):
-                return
-            
-            # Skip if message contains banned words
-            if self.contains_banned_words(message_text):
-                return
-            
-            # Forward to all available groups (up to 20)
-            forwarded_count = 0
-            for group_id in self.forward_groups:
-                if group_id == event.chat_id:
-                    continue  # Don't forward to the same group
-                
-                try:
-                    await self.rate_limiter.wait_for_token()
-                    await self.client.send_message(group_id, message_text)
-                    forwarded_count += 1
-                    await asyncio.sleep(0.5)  # Additional rate limiting
-                except Exception as e:
-                    logger.error(f"Error forwarding to group {group_id}: {e}")
-            
-            if forwarded_count > 0:
-                logger.info(f"Forwarded message from user {user_id} to {forwarded_count} groups")
-                self.db.update_forward_time(user_id)
-        
-        except Exception as e:
-            logger.error(f"Error in message forwarding: {e}")
-    
-    async def propagate_global_ban(self, user_id: int):
-        """Propagate global ban to all groups"""
-        banned_count = 0
-        for group_id in self.forward_groups:
-            try:
-                await self.rate_limited_ban_user(group_id, user_id)
-                banned_count += 1
-            except Exception as e:
-                logger.error(f"Error banning user {user_id} in group {group_id}: {e}")
-        
-        logger.info(f"Propagated global ban for user {user_id} to {banned_count} groups")
-    
-    def contains_banned_words(self, text: str) -> bool:
-        """Check if text contains any banned words"""
-        if not text or not self.banned_words:
-            return False
-        
-        text_lower = text.lower()
-        
-        # Check for exact word matches
-        words = re.findall(r'\b\w+\b', text_lower)
-        for word in words:
-            if word in self.banned_words:
-                return True
-        
-        # Check for substring matches
-        for banned_word in self.banned_words:
-            if banned_word in text_lower:
-                return True
-        
-        return False
-    
-    async def kick_user(self, chat_id: int, user_id: int):
-        """Kick a user from the group"""
-        try:
-            # Ban user temporarily (this kicks them)
-            ban_rights = ChatBannedRights(
-                until_date=datetime.now() + timedelta(seconds=30),
-                view_messages=True
-            )
-            await self.client.edit_permissions(chat_id, user_id, ban_rights)
-            
-            # Immediately unban them (so they can rejoin later)
-            await asyncio.sleep(1)
-            await self.client.edit_permissions(chat_id, user_id, None)
-            
-        except (ChatAdminRequiredError, UserAdminInvalidError):
-            logger.error(f"Bot lacks admin permissions to kick user {user_id}")
-        except FloodWaitError as e:
-            logger.warning(f"Flood wait error, waiting {e.seconds} seconds")
-            await asyncio.sleep(e.seconds)
-        except Exception as e:
-            logger.error(f"Error kicking user {user_id}: {e}")
-
-    async def rpc_call(self, operation_name: str, func, *args, **kwargs):
-        """Wrapper for RPC calls with flood handling"""
-        try:
-            return await func(*args, **kwargs)
-        except FloodWaitError as e:
-            logger.warning(f"Flood wait for {operation_name}: waiting {e.seconds} seconds")
-            await asyncio.sleep(e.seconds)
-            # Retry once after flood wait
-            try:
-                return await func(*args, **kwargs)
-            except Exception as retry_e:
-                logger.error(f"Error in {operation_name} after flood wait: {retry_e}")
-                raise
-        except (ChatAdminRequiredError, UserAdminInvalidError):
-            logger.error(f"Bot lacks admin permissions for {operation_name}")
-            raise
-        except Exception as e:
-            logger.error(f"Error in {operation_name}: {e}")
-            raise
-
-    async def rate_limited_ban_user(self, chat_id: int, user_id: int):
-        """Ban a user with rate limiting"""
-        await self.rate_limiter.wait_for_token()
-        await self.ban_user(chat_id, user_id)
-    
-    async def ban_user(self, chat_id: int, user_id: int):
-        """Ban a user from the group permanently"""
-        try:
-            ban_rights = ChatBannedRights(
-                until_date=None,  # Permanent ban
-                view_messages=True,
-                send_messages=True,
-                send_media=True,
-                send_stickers=True,
-                send_gifs=True,
-                send_games=True,
-                send_inline=True,
-                embed_links=True
-            )
-            await self.client.edit_permissions(chat_id, user_id, ban_rights)
-            
-        except (ChatAdminRequiredError, UserAdminInvalidError):
-            logger.error(f"Bot lacks admin permissions to ban user {user_id}")
-        except FloodWaitError as e:
-            logger.warning(f"Flood wait error, waiting {e.seconds} seconds")
-            await asyncio.sleep(e.seconds)
-        except Exception as e:
-            logger.error(f"Error banning user {user_id}: {e}")
-    
-    async def cleanup_deleted_accounts(self, chat_id: int):
-        """Remove deleted accounts from the group with pagination"""
-        try:
-            last_cleanup, offset = self.db.get_cleanup_state(chat_id)
-            
-            # Get participants with pagination (25 per run)
-            participants = await self.client.get_participants(
-                chat_id, 
-                limit=25, 
-                offset=offset
-            )
+            logger.info(f"Starting cleanup of deleted accounts in group {group_id}")
             
             deleted_count = 0
-            for participant in participants:
-                # Check if user is deleted by checking if user.deleted attribute exists and is True
+            participants_checked = 0
+            
+            async for participant in self.client.iter_participants(
+                group_id, 
+                limit=25,  # Process in small batches
+                offset=last_offset
+            ):
+                participants_checked += 1
+                
+                # Check if account is deleted (no first_name usually indicates deleted account)
                 if hasattr(participant, 'deleted') and participant.deleted:
                     try:
-                        logger.info(f"Removing deleted account: {participant.id}")
                         await self.rate_limiter.wait_for_token()
-                        await self.kick_user(chat_id, participant.id)
+                        await self.client.kick_participant(group_id, participant.id)
                         deleted_count += 1
-                        await asyncio.sleep(1)  # Additional rate limiting
-                    except Exception as e:
-                        logger.error(f"Error removing deleted account {participant.id}: {e}")
+                        logger.info(f"Removed deleted account {participant.id} from group {group_id}")
+                    except Exception as kick_e:
+                        logger.warning(f"Could not remove deleted account {participant.id}: {kick_e}")
             
             # Update cleanup state
-            new_offset = offset + len(participants) if len(participants) == 25 else 0
-            self.db.update_cleanup_state(chat_id, new_offset)
+            new_offset = last_offset + participants_checked
+            self.db.update_cleanup_state(group_id, new_offset)
             
             if deleted_count > 0:
-                logger.info(f"Cleaned up {deleted_count} deleted accounts from group {chat_id}")
-                        
+                logger.info(f"Cleanup completed for group {group_id}: removed {deleted_count} deleted accounts")
+            
         except Exception as e:
-            logger.error(f"Error in cleanup_deleted_accounts: {e}")
+            logger.error(f"Error in cleanup_deleted_accounts for group {group_id}: {e}")
+    
+    async def start(self):
+        """Start the bot and register event handlers"""
+        await self.client.start(bot_token=self.bot_token)
+        logger.info("Bot started successfully")
+        
+        # Discover forward groups
+        await self.discover_forward_groups()
+        
+        # Register event handlers
+        @self.client.on(events.NewMessage)
+        async def on_new_message(event):
+            await self.handle_message(event)
+        
+        @self.client.on(events.ChatAction)
+        async def on_chat_action(event):
+            await self.handle_new_member(event)
+        
+        # Start maintenance loop
+        asyncio.create_task(self.maintenance_loop())
+        
+        logger.info("Bot is running and ready to handle events")
     
     async def maintenance_loop(self):
-        """Run maintenance tasks (cleanup every 12 hours)"""
+        """Background maintenance tasks"""
         while True:
             try:
-                # Wait 12 hours
-                await asyncio.sleep(12 * 3600)
+                await asyncio.sleep(3600)  # Run every hour
                 
-                logger.info("Starting maintenance loop")
-                
-                # Clean up all groups the bot is in (one group per run, rotating)
-                if self.forward_groups:
-                    # Rotate through groups, one group per maintenance cycle
-                    group_count = len(self.forward_groups)
-                    if group_count > 0:
-                        # Get current time to determine which group to clean
-                        current_time = int(time.time())
-                        group_index = (current_time // (12 * 3600)) % group_count
-                        group_to_clean = self.forward_groups[group_index]
-                        
-                        logger.info(f"Cleaning group {group_to_clean} (index {group_index})")
-                        await self.cleanup_deleted_accounts(group_to_clean)
+                group_count = len(self.forward_groups)
+                if group_count > 0:
+                    # Rotational cleanup - clean one group per 12h cycle
+                    current_time = int(time.time())
+                    group_index = (current_time // (12 * 3600)) % group_count
+                    group_to_clean = self.forward_groups[group_index]
+                    
+                    logger.info(f"Cleaning group {group_to_clean} (index {group_index})")
+                    await self.cleanup_deleted_accounts(group_to_clean)
                 
                 logger.info("Maintenance loop completed")
                                 
